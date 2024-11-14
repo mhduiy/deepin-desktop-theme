@@ -1,3 +1,9 @@
+deepin-desktop-theme (1.0.25) unstable; urgency=medium
+
+  * release 1.0.25
+
+ -- zhangkun <zhangkun2@uniontech.com>  Thu, 14 Nov 2024 16:01:33 +0800
+
 deepin-desktop-theme (1.0.24) unstable; urgency=medium
 
   * feat: add icons directory to place generic icons

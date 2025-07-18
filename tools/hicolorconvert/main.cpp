@@ -70,12 +70,38 @@ private:
     QMutex m_logMutex;
     QMutex m_recordMutex;
     
+    // 目录扫描缓存
+    struct DirectoryCache {
+        QStringList sizeDirectories;  // 所有尺寸目录 (如 16x16/apps, 24x24/apps)
+        QStringList appDirectories;   // 所有应用目录 (如 /apps, scalable/apps)
+        QMap<QString, QStringList> iconFilesByDir;  // 每个目录下的图标文件
+        QSet<QString> allIconNames;   // 所有图标名称
+        bool isInitialized = false;
+    };
+    DirectoryCache m_dirCache;
+    
+    // 支持的上下文类型（方便扩展）
+    QStringList m_supportedContexts = {"apps"};  // 目前只支持apps，后续可扩展
+    
+    // 图标转换优先级列表（越靠前优先级越高）
+    // 若前面优先级的图标已经处理，则后面的无需处理
+    QStringList m_iconPriorities = {
+        // 多尺寸图标（*x*/apps）优先级最高，使用批量转换
+        // 这些会在处理多尺寸图标时统一处理，不在此列表中
+        "scalable/apps",    // 最高优先级
+        "symbolic/apps",    // 第二优先级
+        "apps",            // 第三优先级
+        // 其余路径的图标按默认排序处理
+    };
+    
     // 核心功能
     bool checkDciTool();
     bool createDirectories();
+    void initializeDirectoryCache();
     
     void logMessage(const QString &message);
     QString getFileHash(const QString &filePath);
+    QString calculateMultiSizeHash(const QStringList &sourceFiles);
     bool isNoNeedConverted(const QString &sourceFile, const QString &currentHash);
     void saveConversionRecord(const QString &sourceFile, const QString &targetFile, const QString &sourceHash);
     bool convertIconFile(const QString &sourceFile);
@@ -90,6 +116,8 @@ private:
     // 并发转换方法
     ConvertResult convertIconConcurrent(const ConvertTask &task);
     ConvertResult convertMultiSizeIconConcurrent(const MultiSizeConvertTask &task);
+    void convertMultiSizeIconBatch(const QList<MultiSizeConvertTask> &tasks);
+    void convertSingleSizeIconBatch(const QList<ConvertTask> &tasks);
 };
 
 HicolorConverter::HicolorConverter()
@@ -143,6 +171,9 @@ bool HicolorConverter::initialize()
     }
     m_logStream.setDevice(&m_logFileHandle);
     
+    // 初始化目录扫描缓存
+    initializeDirectoryCache();
+    
     return true;
 }
 
@@ -188,6 +219,63 @@ bool HicolorConverter::createDirectories()
     return true;
 }
 
+void HicolorConverter::initializeDirectoryCache()
+{
+    if (m_dirCache.isInitialized) {
+        return;
+    }
+    
+    logMessage("初始化目录扫描缓存...");
+    
+    m_dirCache.sizeDirectories.clear();
+    m_dirCache.appDirectories.clear();
+    m_dirCache.iconFilesByDir.clear();
+    m_dirCache.allIconNames.clear();
+    
+    QDir sourceDir(m_sourceDir);
+    QStringList entries = sourceDir.entryList(QDir::Dirs | QDir::NoDotAndDotDot);
+    
+    // 扫描所有尺寸目录和特殊目录
+    for (const QString &entry : entries) {
+        for (const QString &context : m_supportedContexts) {
+            QString contextDir = m_sourceDir + "/" + entry + "/" + context;
+            
+            if (QDir(contextDir).exists()) {
+                // 检查是否是尺寸目录 (如 16x16, 24x24)
+                if (entry.contains('x') && entry.split('x').size() == 2) {
+                    QStringList parts = entry.split('x');
+                    bool ok1, ok2;
+                    parts[0].toInt(&ok1);
+                    parts[1].toInt(&ok2);
+                    if (ok1 && ok2) {
+                        m_dirCache.sizeDirectories.append(contextDir);
+                    }
+                } else {
+                    // 其他目录 (如 scalable/apps)
+                    m_dirCache.appDirectories.append(contextDir);
+                }
+                
+                // 扫描该目录下的图标文件
+                QStringList iconFiles = getSupportedIconFiles(contextDir);
+                m_dirCache.iconFilesByDir[contextDir] = iconFiles;
+                
+                // 收集所有图标名称
+                for (const QString &iconFile : iconFiles) {
+                    QFileInfo fileInfo(iconFile);
+                    QString iconName = fileInfo.completeBaseName();
+                    m_dirCache.allIconNames.insert(iconName);
+                }
+            }
+        }
+    }
+    
+    m_dirCache.isInitialized = true;
+    logMessage(QString("目录扫描缓存初始化完成: %1个尺寸目录, %2个应用目录, %3个图标")
+               .arg(m_dirCache.sizeDirectories.size())
+               .arg(m_dirCache.appDirectories.size())
+               .arg(m_dirCache.allIconNames.size()));
+}
+
 void HicolorConverter::logMessage(const QString &message)
 {
     QMutexLocker locker(&m_logMutex);
@@ -217,6 +305,25 @@ QString HicolorConverter::getFileHash(const QString &filePath)
     return hash.result().toHex();
 }
 
+QString HicolorConverter::calculateMultiSizeHash(const QStringList &sourceFiles)
+{
+    QCryptographicHash hash(QCryptographicHash::Md5);
+    
+    // 对文件列表排序以确保hash的一致性
+    QStringList sortedFiles = sourceFiles;
+    sortedFiles.sort();
+    
+    for (const QString &filePath : sortedFiles) {
+        QFile file(filePath);
+        if (file.open(QIODevice::ReadOnly)) {
+            hash.addData(&file);
+            file.close();
+        }
+    }
+    
+    return hash.result().toHex();
+}
+
 bool HicolorConverter::isNoNeedConverted(const QString &sourceFile, const QString &currentHash)
 {
     logMessage(QString("检查是否需要转换: %1, %2").arg(sourceFile).arg(currentHash));
@@ -239,24 +346,25 @@ bool HicolorConverter::isNoNeedConverted(const QString &sourceFile, const QStrin
         
         while (stream.readLineInto(&line)) {
             QStringList parts = line.split('|');
-            if (parts.size() >= 5) {
+            if (parts.size() >= 2) {
                 QString recordedIconName = parts[0];
-                QString recordedSourceFile = parts[1];
-                QString recordedTargetFile = parts[2];
-                QString recordedHash = parts[3];
+                QString recordedHash = parts[1];
 
                 // 如果有转换记录
                 if (recordedIconName == sourceIconName) {
                     isRecord = true;
+                    
+                    // 构造目标文件路径
+                    QString targetFile = m_targetDir + "/" + recordedIconName + ".dci";
 
-                    if (recordedHash == currentHash && QFile::exists(recordedTargetFile)) {
+                    if (recordedHash == currentHash && QFile::exists(targetFile)) {
                         // 已经转换过，且文件未变化
                         logMessage(QString("跳过已转换: %1").arg(sourceFile));
                         return true;
-                    } else if (recordedIconName == recordedSourceFile && QFile::exists(recordedTargetFile)) {
-                        // 已经转换过多尺寸图标，这次检查的同名单尺寸，以多尺寸图标为准，无需转换
-                        logMessage(QString("已经转换过多尺寸图标，这次检查的同名单尺寸，以多尺寸图标为准，无需转换: %1").arg(sourceFile));
-                        return true;
+                    } else if (recordedHash != currentHash && QFile::exists(targetFile)) {
+                        // hash不匹配，需要重新转换
+                        logMessage(QString("源文件已变化，需要重新转换: %1").arg(sourceFile));
+                        return false;
                     }
 
                     break;
@@ -291,7 +399,6 @@ void HicolorConverter::saveConversionRecord(const QString &sourceFile, const QSt
     }
     
     QTextStream stream(&recordFile);
-    QString timestamp = QDateTime::currentDateTime().toString("yyyy-MM-dd hh:mm:ss");
     
     // 计算图标名
     QString iconName;
@@ -303,8 +410,8 @@ void HicolorConverter::saveConversionRecord(const QString &sourceFile, const QSt
         iconName = sourceFile;
     }
     
-    // 新格式：图标名|原始路径|转换后路径|hash|时间
-    stream << iconName << "|" << sourceFile << "|" << targetFile << "|" << sourceHash << "|" << timestamp << Qt::endl;
+    // 简化格式：只存储图标名和hash
+    stream << iconName << "|" << sourceHash << Qt::endl;
 }
 
 bool HicolorConverter::convertIconFile(const QString &sourceFile)
@@ -557,38 +664,14 @@ QList<MultiSizeConvertTask> HicolorConverter::collectMultiSizeIcons()
     QList<MultiSizeConvertTask> tasks;
     QMap<QString, MultiSizeConvertTask> iconGroups;
     
-    // 扫描所有尺寸目录
-    QStringList sizeDirectories;
-    QDir sourceDir(m_sourceDir);
-    QStringList entries = sourceDir.entryList(QDir::Dirs | QDir::NoDotAndDotDot);
-    
-    for (const QString &entry : entries) {
-        // 匹配 *x* 格式的尺寸目录
-        if (entry.contains('x') && entry.split('x').size() == 2) {
-            QStringList parts = entry.split('x');
-            bool ok1, ok2;
-            parts[0].toInt(&ok1);
-            parts[1].toInt(&ok2);
-            if (ok1 && ok2) {
-                QString sizeDir = m_sourceDir + "/" + entry + "/apps";
-                if (QDir(sizeDir).exists()) {
-                    sizeDirectories.append(sizeDir);
-                }
-            }
-        }
-    }
-    
-    // logMessage(QString("找到 %1 个尺寸目录").arg(sizeDirectories.size()));
-    
-    // 收集每个尺寸目录中的图标文件
-    for (const QString &sizeDir : sizeDirectories) {
+    // 使用缓存的尺寸目录信息
+    for (const QString &sizeDir : m_dirCache.sizeDirectories) {
         QString size = QFileInfo(sizeDir).dir().dirName(); // 获取尺寸 (如 "16x16")
         QString sizeValue = size.split('x').first(); // 获取尺寸值 (如 "16")
         
-        QStringList iconFiles = getSupportedIconFiles(sizeDir);
+        QStringList iconFiles = m_dirCache.iconFilesByDir.value(sizeDir);
         
         for (const QString &iconFile : iconFiles) {
-            
             QFileInfo fileInfo(iconFile);
             QString iconName = fileInfo.completeBaseName();
 
@@ -601,10 +684,16 @@ QList<MultiSizeConvertTask> HicolorConverter::collectMultiSizeIcons()
         }
     }
     
-    // 只保留有多个尺寸的图标
+    // 过滤出有多个尺寸的图标，并检查是否需要转换
     for (auto it = iconGroups.begin(); it != iconGroups.end(); ++it) {
-        if (it.value().sourceFiles.size() > 1) {
-            tasks.append(it.value());
+        if (it.value().sourceFiles.size() >= 1) {
+            // 计算多尺寸图标的综合hash
+            QString combinedHash = calculateMultiSizeHash(it.value().sourceFiles);
+            
+            // 检查是否需要转换
+            if (!isNoNeedConverted(it.value().iconName, combinedHash)) {
+                tasks.append(it.value());
+            }
         }
     }
     
@@ -726,103 +815,110 @@ ConvertResult HicolorConverter::convertMultiSizeIconConcurrent(const MultiSizeCo
 
 void HicolorConverter::scanAndConvert()
 {
-    logMessage("开始扫描 hicolor 应用图标目录");
+    logMessage("==== 开始分阶段转换 hicolor 应用图标 ====");
     
-    // 首先处理多尺寸图标
-    QList<MultiSizeConvertTask> multiSizeTasks = collectMultiSizeIcons();
+    // 阶段1: 扫描和准备阶段
+    logMessage("阶段1: 扫描所有图标并准备转换任务");
     
-    if (!multiSizeTasks.isEmpty()) {
-        logMessage(QString("找到 %1 个多尺寸图标，开始并发转换...").arg(multiSizeTasks.size()));
+    QSet<QString> processedIcons;  // 已处理的图标名称
+    
+    // 优先处理多尺寸图标（*x*/apps 尺寸图标）- 最高优先级
+    logMessage("优先处理多尺寸图标（按尺寸目录分组批量转换）");
+    
+    // 收集多尺寸图标任务
+    QMap<QString, MultiSizeConvertTask> multiSizeTasks;  // iconName -> MultiSizeConvertTask
+    
+    for (const QString &sizeDir : m_dirCache.sizeDirectories) {
+        logMessage(QString("扫描尺寸目录: %1").arg(sizeDir));
         
-        // 使用 QtConcurrent::blockingMapped 并发处理多尺寸任务
-        QList<ConvertResult> multiSizeResults = QtConcurrent::blockingMapped(multiSizeTasks, [this](const MultiSizeConvertTask &task) {
-            return convertMultiSizeIconConcurrent(task);
-        });
+        // 获取该目录下的所有支持的图标文件
+        QStringList iconFiles = m_dirCache.iconFilesByDir.value(sizeDir);
         
-        // 统计多尺寸转换结果
-        int multiSizeConverted = 0;
-        int multiSizeSkipped = 0;
-        int multiSizeFailed = 0;
-        
-        for (const ConvertResult &result : multiSizeResults) {
-            if (result.success) {
-                if (result.targetFile.isEmpty()) {
-                    multiSizeSkipped++;
-                } else {
-                    multiSizeConverted++;
-                    logMessage(QString("多尺寸转换成功: %1 -> %2").arg(result.sourceFile, result.targetFile));
-                }
-            } else {
-                multiSizeFailed++;
-                logMessage(QString("多尺寸转换失败: %1, 错误: %2").arg(result.sourceFile, result.errorMessage));
-            }
+        // 从路径中提取尺寸信息 (如 16x16/apps -> 16)
+        QFileInfo dirInfo(sizeDir);
+        QString sizeStr = dirInfo.dir().dirName();
+        if (sizeStr.contains("x")) {
+            sizeStr = sizeStr.split("x").first();  // 16x16 -> 16
         }
         
-        logMessage(QString("多尺寸转换完成 - 转换: %1, 跳过: %2, 失败: %3").arg(multiSizeConverted).arg(multiSizeSkipped).arg(multiSizeFailed));
-        
-        m_totalConverted += multiSizeConverted;
-        m_totalSkipped += multiSizeSkipped;
-        m_totalFailed += multiSizeFailed;
+        for (const QString &sourceFile : iconFiles) {
+            QFileInfo sourceInfo(sourceFile);
+            QString iconName = sourceInfo.completeBaseName();
+            
+            // 如果该图标已经被处理过，跳过
+            if (processedIcons.contains(iconName)) {
+                continue;
+            }
+            
+            // 检查是否需要转换
+            QString sourceHash = getFileHash(sourceFile);
+            if (!isNoNeedConverted(sourceFile, sourceHash)) {
+                // 添加到多尺寸任务中
+                if (!multiSizeTasks.contains(iconName)) {
+                    multiSizeTasks[iconName] = MultiSizeConvertTask{iconName, {}, {}};
+                }
+                multiSizeTasks[iconName].sourceFiles.append(sourceFile);
+                multiSizeTasks[iconName].sizes.append(sizeStr);
+            }
+        }
     }
     
-    // 然后处理单尺寸图标（apps 和 scalable/apps 目录）
-    QList<ConvertTask> tasks;
-    
-    // 遍历所有应用图标目录
-    for (const QString &appDir : m_appDirs) {
-        QString fullAppDir = m_sourceDir + "/" + appDir;
+    // 执行多尺寸图标批量转换
+    if (!multiSizeTasks.isEmpty()) {
+        QList<MultiSizeConvertTask> tasks = multiSizeTasks.values();
+        logMessage(QString("准备批量转换 %1 个多尺寸图标").arg(tasks.size()));
+        convertMultiSizeIconBatch(tasks);
         
-        if (!QDir(fullAppDir).exists()) {
-            logMessage(QString("应用图标目录不存在: %1").arg(fullAppDir));
+        // 标记这些图标已处理
+        for (const auto &task : tasks) {
+            processedIcons.insert(task.iconName);
+        }
+    }
+    
+    // 阶段2: 处理其他优先级的单尺寸图标
+    logMessage("阶段2: 处理其他优先级的单尺寸图标");
+    
+    QList<ConvertTask> singleSizeIconTasks;
+    
+    // 按优先级顺序处理图标
+    for (const QString &priority : m_iconPriorities) {
+        QString priorityDir = m_sourceDir + "/" + priority;
+        
+        // 检查该优先级目录是否存在于缓存中
+        if (!m_dirCache.iconFilesByDir.contains(priorityDir)) {
             continue;
         }
         
-        logMessage(QString("扫描目录: %1").arg(fullAppDir));
+        logMessage(QString("扫描优先级目录: %1").arg(priorityDir));
         
         // 获取该目录下的所有支持的图标文件
-        QStringList iconFiles = getSupportedIconFiles(fullAppDir);
+        QStringList iconFiles = m_dirCache.iconFilesByDir.value(priorityDir);
         
         for (const QString &sourceFile : iconFiles) {
-            QString relativePath = getRelativePath(m_sourceDir, sourceFile);
-            tasks.append({sourceFile, relativePath});
+            QFileInfo sourceInfo(sourceFile);
+            QString iconName = sourceInfo.completeBaseName();
+            
+            // 如果该图标已经被处理过，跳过
+            if (processedIcons.contains(iconName)) {
+                continue;
+            }
+            
+            // 检查是否需要转换
+            QString sourceHash = getFileHash(sourceFile);
+            if (!isNoNeedConverted(sourceFile, sourceHash)) {
+                QString relativePath = getRelativePath(m_sourceDir, sourceFile);
+                singleSizeIconTasks.append({sourceFile, relativePath});
+                processedIcons.insert(iconName);  // 标记为已处理
+            }
         }
     }
     
-    if (tasks.isEmpty()) {
-        logMessage("没有找到需要转换的单尺寸图标文件");
+    // 执行单尺寸图标批量转换
+    if (!singleSizeIconTasks.isEmpty()) {
+        logMessage(QString("准备批量转换 %1 个单尺寸图标").arg(singleSizeIconTasks.size()));
+        convertSingleSizeIconBatch(singleSizeIconTasks);
     } else {
-        logMessage(QString("找到 %1 个单尺寸图标文件，开始并发转换...").arg(tasks.size()));
-        
-        // 使用 QtConcurrent::blockingMapped 并发处理所有任务
-        QList<ConvertResult> results = QtConcurrent::blockingMapped(tasks, [this](const ConvertTask &task) {
-            return convertIconConcurrent(task);
-        });
-        
-        // 统计结果
-        int convertedCount = 0;
-        int skippedCount = 0;
-        int failedCount = 0;
-        
-        for (const ConvertResult &result : results) {
-            if (result.success) {
-                if (result.targetFile.isEmpty()) {
-                    // 这个文件被跳过了（已经转换过）
-                    skippedCount++;
-                } else {
-                    convertedCount++;
-                    logMessage(QString("转换成功: %1 -> %2").arg(result.sourceFile, result.targetFile));
-                }
-            } else {
-                failedCount++;
-                logMessage(QString("转换失败: %1, 错误: %2").arg(result.sourceFile, result.errorMessage));
-            }
-        }
-        
-        logMessage(QString("单尺寸转换完成 - 转换: %1, 跳过: %2, 失败: %3").arg(convertedCount).arg(skippedCount).arg(failedCount));
-        
-        m_totalConverted += convertedCount;
-        m_totalSkipped += skippedCount;
-        m_totalFailed += failedCount;
+        logMessage("没有需要转换的单尺寸图标，跳过");
     }
 }
 
@@ -844,48 +940,22 @@ void HicolorConverter::cleanupOrphanedDci()
     
     while (stream.readLineInto(&line)) {
         QStringList parts = line.split('|');
-        if (parts.size() >= 5) {
+        if (parts.size() >= 2) {
             QString iconName = parts[0];
-            QString sourceFile = parts[1];
-            QString targetFile = parts[2];
+            QString recordedHash = parts[1];
             
-            bool shouldKeep = false;
-            
-            // 检查是否是多尺寸图标记录（源文件字段不包含路径分隔符）
-            if (!sourceFile.contains('/')) {
-                // 这是多尺寸图标记录，检查是否有对应的多尺寸源文件存在
-                QDir sourceDir(m_sourceDir);
-                QStringList entries = sourceDir.entryList(QDir::Dirs | QDir::NoDotAndDotDot);
-                
-                for (const QString &entry : entries) {
-                    if (entry.contains('x') && entry.split('x').size() == 2) {
-                        QString sizeDir = m_sourceDir + "/" + entry + "/apps";
-                        if (QDir(sizeDir).exists()) {
-                            QStringList iconFiles = getSupportedIconFiles(sizeDir);
-                            for (const QString &iconFile : iconFiles) {
-                                QFileInfo fileInfo(iconFile);
-                                if (fileInfo.completeBaseName() == sourceFile) {
-                                    shouldKeep = true;
-                                    break;
-                                }
-                            }
-                            if (shouldKeep) break;
-                        }
-                    }
-                }
-            } else {
-                // 这是单尺寸图标记录，直接检查文件是否存在
-                shouldKeep = QFile::exists(sourceFile);
-            }
+            // 检查该图标是否还存在于原始目录中
+            bool shouldKeep = m_dirCache.allIconNames.contains(iconName);
             
             if (shouldKeep) {
                 // 源文件存在，保留记录
                 validRecords << line;
             } else {
                 // 源文件不存在，删除对应的 dci 文件
+                QString targetFile = m_targetDir + "/" + iconName + ".dci";
                 if (QFile::exists(targetFile)) {
                     if (QFile::remove(targetFile)) {
-                        logMessage(QString("删除孤立的 dci 文件: %1 (源文件已删除: %2)").arg(targetFile, sourceFile));
+                        logMessage(QString("删除孤立的 dci 文件: %1 (源图标已删除: %2)").arg(targetFile, iconName));
                         cleanedCount++;
                     }
                 }
@@ -905,6 +975,175 @@ void HicolorConverter::cleanupOrphanedDci()
     }
     
     logMessage(QString("清理完成 - 删除孤立文件: %1").arg(cleanedCount));
+}
+
+void HicolorConverter::convertMultiSizeIconBatch(const QList<MultiSizeConvertTask> &tasks)
+{
+    if (tasks.isEmpty()) {
+        return;
+    }
+    
+    logMessage(QString("阶段2: 开始批量转换 %1 个多尺寸图标").arg(tasks.size()));
+    
+    // 创建多尺寸图标的临时目录
+    QString tempDir = QDir::temp().absoluteFilePath("hicolor-convert-multisize");
+    QDir().mkpath(tempDir);
+    
+    // 准备多尺寸图标的目录结构
+    // 按尺寸组织目录结构，将所有多尺寸图标按尺寸分类放置
+    QSet<QString> createdSizeDirs;
+    
+    for (const MultiSizeConvertTask &task : tasks) {
+        for (int i = 0; i < task.sourceFiles.size(); ++i) {
+            QString sourceFile = task.sourceFiles[i];
+            QString size = task.sizes[i];
+            
+            // 创建尺寸目录 (如 16/, 24/)
+            QString sizeDir = tempDir + "/" + size;
+            if (!createdSizeDirs.contains(sizeDir)) {
+                QDir().mkpath(sizeDir);
+                createdSizeDirs.insert(sizeDir);
+            }
+            
+            // 复制文件到对应尺寸目录
+            QFileInfo sourceInfo(sourceFile);
+            QString destFile = sizeDir + "/" + sourceInfo.fileName();
+            QFile::copy(sourceFile, destFile);
+        }
+    }
+    
+    // 为多尺寸图标转换准备输出目录
+    QString multiSizeOutputDir = m_targetDir + "_multisize_temp";
+    
+    // 确保输出目录不存在
+    if (QDir(multiSizeOutputDir).exists()) {
+        QDir(multiSizeOutputDir).removeRecursively();
+    }
+    
+    // 批量执行转换命令
+    QStringList arguments;
+    arguments << tempDir;
+    arguments << "-o" << multiSizeOutputDir;
+    arguments << "-O" << "3=95";
+    
+    QProcess process;
+    process.start(m_dciTool, arguments);
+    process.waitForFinished(-1);
+    
+    if (process.exitCode() == 0) {
+        logMessage(QString("多尺寸图标批量转换成功，共转换 %1 个图标").arg(tasks.size()));
+        
+        // 将生成的dci文件移动到目标目录
+        QDir outputDir(multiSizeOutputDir);
+        QStringList dciFiles = outputDir.entryList(QStringList() << "*.dci", QDir::Files);
+        
+        for (const QString &dciFile : dciFiles) {
+            QString sourcePath = multiSizeOutputDir + "/" + dciFile;
+            QString targetPath = m_targetDir + "/" + dciFile;
+            
+            if (QFile::exists(targetPath)) {
+                QFile::remove(targetPath);
+            }
+            QFile::copy(sourcePath, targetPath);
+        }
+        
+        // 记录转换结果
+        for (const MultiSizeConvertTask &task : tasks) {
+            QString combinedHash = calculateMultiSizeHash(task.sourceFiles);
+            QString targetFile = m_targetDir + "/" + task.iconName + ".dci";
+            saveConversionRecord(task.iconName, targetFile, combinedHash);
+            m_totalConverted++;
+        }
+        
+        // 清理临时输出目录
+        QDir(multiSizeOutputDir).removeRecursively();
+    } else {
+        logMessage(QString("多尺寸图标批量转换失败: %1").arg(QString::fromLocal8Bit(process.readAllStandardError())));
+        m_totalFailed += tasks.size();
+    }
+    
+    // 清理临时目录
+    QDir(tempDir).removeRecursively();
+}
+
+void HicolorConverter::convertSingleSizeIconBatch(const QList<ConvertTask> &tasks)
+{
+    if (tasks.isEmpty()) {
+        return;
+    }
+    
+    logMessage(QString("阶段3: 开始批量转换 %1 个单尺寸图标").arg(tasks.size()));
+    
+    // 创建单尺寸图标的临时目录
+    QString singleSizeTempDir = QDir::temp().absoluteFilePath("hicolor-convert-singlesize");
+    QDir().mkpath(singleSizeTempDir);
+    
+    // 准备单尺寸图标的目录结构
+    // 创建scalable目录（单尺寸图标统一放在scalable下）
+    QString scalableDir = singleSizeTempDir + "/scalable";
+    QDir().mkpath(scalableDir);
+    
+    // 复制所有单尺寸图标文件到scalable目录
+    for (const ConvertTask &task : tasks) {
+        QFileInfo sourceInfo(task.sourceFile);
+        QString destFile = scalableDir + "/" + sourceInfo.fileName();
+        QFile::copy(task.sourceFile, destFile);
+    }
+    
+    // 为单尺寸图标转换准备输出目录
+    QString singleSizeOutputDir = m_targetDir + "_singlesize_temp";
+    
+    // 确保输出目录不存在
+    if (QDir(singleSizeOutputDir).exists()) {
+        QDir(singleSizeOutputDir).removeRecursively();
+    }
+    
+    // 执行单尺寸图标批量转换命令
+    QStringList arguments;
+    arguments << singleSizeTempDir;
+    arguments << "-o" << singleSizeOutputDir;
+    arguments << "-O" << "3=95";
+    
+    QProcess process;
+    process.start(m_dciTool, arguments);
+    process.waitForFinished(-1);
+    
+    if (process.exitCode() == 0) {
+        logMessage(QString("单尺寸图标批量转换成功，共转换 %1 个图标").arg(tasks.size()));
+        
+        // 将生成的dci文件移动到目标目录
+        QDir outputDir(singleSizeOutputDir);
+        QStringList dciFiles = outputDir.entryList(QStringList() << "*.dci", QDir::Files);
+        
+        for (const QString &dciFile : dciFiles) {
+            QString sourcePath = singleSizeOutputDir + "/" + dciFile;
+            QString targetPath = m_targetDir + "/" + dciFile;
+            
+            if (QFile::exists(targetPath)) {
+                QFile::remove(targetPath);
+            }
+            QFile::copy(sourcePath, targetPath);
+        }
+        
+        // 记录转换结果
+        for (const ConvertTask &task : tasks) {
+            QFileInfo sourceInfo(task.sourceFile);
+            QString iconName = sourceInfo.completeBaseName();
+            QString sourceHash = getFileHash(task.sourceFile);
+            QString targetFile = m_targetDir + "/" + iconName + ".dci";
+            saveConversionRecord(task.sourceFile, targetFile, sourceHash);
+            m_totalConverted++;
+        }
+        
+        // 清理临时输出目录
+        QDir(singleSizeOutputDir).removeRecursively();
+    } else {
+        logMessage(QString("单尺寸图标批量转换失败: %1").arg(QString::fromLocal8Bit(process.readAllStandardError())));
+        m_totalFailed += tasks.size();
+    }
+    
+    // 清理临时目录
+    QDir(singleSizeTempDir).removeRecursively();
 }
 
 int HicolorConverter::run()

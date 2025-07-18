@@ -16,6 +16,7 @@
 #include <QMutex>
 #include <QObject>
 #include <QMap>
+#include <qcontainerfwd.h>
 #include <qdir.h>
 #include <qlogging.h>
 
@@ -30,14 +31,6 @@ struct MultiSizeConvertTask {
     QString iconName;
     QStringList sourceFiles;  // 不同尺寸的源文件列表
     QStringList sizes;        // 对应的尺寸列表
-};
-
-// 转换结果结构
-struct ConvertResult {
-    bool success;
-    QString sourceFile;
-    QString targetFile;
-    QString errorMessage;
 };
 
 class HicolorConverter {
@@ -70,6 +63,11 @@ private:
     QMutex m_logMutex;
     QMutex m_recordMutex;
     
+    // 内存中的记录缓存
+    QMap<QString, QString> m_recordCache;  // iconName -> hash
+    bool m_recordCacheLoaded = false;
+    bool m_recordCacheModified = false;
+
     // 目录扫描缓存
     struct DirectoryCache {
         QStringList sizeDirectories;  // 所有尺寸目录 (如 16x16/apps, 24x24/apps)
@@ -93,29 +91,29 @@ private:
         "apps",            // 第三优先级
         // 其余路径的图标按默认排序处理
     };
-    
+
     // 核心功能
     bool checkDciTool();
     bool createDirectories();
     void initializeDirectoryCache();
-    
+
+    // 记录缓存管理
+    void loadRecordCache();
+    void flushRecordCache();
+
     void logMessage(const QString &message);
     QString getFileHash(const QString &filePath);
     QString calculateMultiSizeHash(const QStringList &sourceFiles);
     bool isNoNeedConverted(const QString &sourceFile, const QString &currentHash);
     void saveConversionRecord(const QString &sourceFile, const QString &targetFile, const QString &sourceHash);
-    bool convertIconFile(const QString &sourceFile);
     void scanAndConvert();
     void cleanupOrphanedDci();
-    
+
     // 工具函数
     QString getRelativePath(const QString &basePath, const QString &fullPath);
     QStringList getSupportedIconFiles(const QString &directory);
-    QList<MultiSizeConvertTask> collectMultiSizeIcons();
-    
+
     // 并发转换方法
-    ConvertResult convertIconConcurrent(const ConvertTask &task);
-    ConvertResult convertMultiSizeIconConcurrent(const MultiSizeConvertTask &task);
     void convertMultiSizeIconBatch(const QList<MultiSizeConvertTask> &tasks);
     void convertSingleSizeIconBatch(const QList<ConvertTask> &tasks);
 };
@@ -174,6 +172,9 @@ bool HicolorConverter::initialize()
     // 初始化目录扫描缓存
     initializeDirectoryCache();
     
+    // 初始化记录缓存
+    loadRecordCache();
+    
     return true;
 }
 
@@ -225,8 +226,6 @@ void HicolorConverter::initializeDirectoryCache()
         return;
     }
     
-    logMessage("初始化目录扫描缓存...");
-    
     m_dirCache.sizeDirectories.clear();
     m_dirCache.appDirectories.clear();
     m_dirCache.iconFilesByDir.clear();
@@ -242,12 +241,8 @@ void HicolorConverter::initializeDirectoryCache()
             
             if (QDir(contextDir).exists()) {
                 // 检查是否是尺寸目录 (如 16x16, 24x24)
-                if (entry.contains('x') && entry.split('x').size() == 2) {
-                    QStringList parts = entry.split('x');
-                    bool ok1, ok2;
-                    parts[0].toInt(&ok1);
-                    parts[1].toInt(&ok2);
-                    if (ok1 && ok2) {
+                if (QStringList parts = entry.split('x'); parts.size() == 2 && parts.first() == parts.last()) {
+                    if (parts[0].toInt() && parts[1].toInt()) {
                         m_dirCache.sizeDirectories.append(contextDir);
                     }
                 } else {
@@ -324,58 +319,100 @@ QString HicolorConverter::calculateMultiSizeHash(const QStringList &sourceFiles)
     return hash.result().toHex();
 }
 
+void HicolorConverter::loadRecordCache()
+{
+    if (m_recordCacheLoaded) {
+        return;  // 已经加载过了
+    }
+    
+    QFile recordFile(m_recordFile);
+    if (recordFile.open(QIODevice::ReadOnly)) {
+        QTextStream stream(&recordFile);
+        QString line;
+        int recordCount = 0;
+        
+        while (stream.readLineInto(&line)) {
+            QStringList parts = line.split('|');
+            if (parts.size() >= 2) {
+                QString iconName = parts[0];
+                QString hash = parts[1];
+                m_recordCache[iconName] = hash;
+                recordCount++;
+            }
+        }
+        recordFile.close();
+        
+        logMessage(QString("加载了 %1 条转换记录到内存").arg(recordCount));
+    } else {
+        logMessage("转换记录文件不存在或无法读取，使用空缓存");
+    }
+    
+    m_recordCacheLoaded = true;
+    m_recordCacheModified = false;
+}
+
+void HicolorConverter::flushRecordCache()
+{
+    if (!m_recordCacheLoaded || !m_recordCacheModified) {
+        return;  // 没有加载或没有修改，无需写入
+    }
+    
+    logMessage("将转换记录缓存写入文件");
+    
+    QMutexLocker locker(&m_recordMutex);
+    
+    QFile recordFile(m_recordFile);
+    if (!recordFile.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+        logMessage(QString("警告: 无法写入转换记录文件: %1").arg(m_recordFile));
+        return;
+    }
+    
+    QTextStream stream(&recordFile);
+    int recordCount = 0;
+    
+    for (auto it = m_recordCache.begin(); it != m_recordCache.end(); ++it) {
+        stream << it.key() << "|" << it.value() << Qt::endl;
+        recordCount++;
+    }
+    
+    recordFile.close();
+    
+    logMessage(QString("写入了 %1 条转换记录到文件").arg(recordCount));
+    m_recordCacheModified = false;
+}
+
 bool HicolorConverter::isNoNeedConverted(const QString &sourceFile, const QString &currentHash)
 {
-    logMessage(QString("检查是否需要转换: %1, %2").arg(sourceFile).arg(currentHash));
-    bool isRecord = false;
+    // 确保记录缓存已加载
+    if (!m_recordCacheLoaded) {
+        loadRecordCache();
+    }
     
     QString sourceIconName;
 
-    // 区分传递绝对路径和图标名的情况
+    // 区分多尺寸和单尺寸的情况
     if (sourceFile.startsWith("/")) {
         sourceIconName = QFileInfo(sourceFile).completeBaseName();
     } else {
         sourceIconName = sourceFile;
     }
 
-    logMessage(QString("sourceIconName: %1").arg(sourceIconName));
-    QFile recordFile(m_recordFile);
-    if (recordFile.open(QIODevice::ReadOnly)) {
-        QTextStream stream(&recordFile);
-        QString line;
-        
-        while (stream.readLineInto(&line)) {
-            QStringList parts = line.split('|');
-            if (parts.size() >= 2) {
-                QString recordedIconName = parts[0];
-                QString recordedHash = parts[1];
+    // 从内存缓存中查找记录
+    if (m_recordCache.contains(sourceIconName)) {
+        QString recordedHash = m_recordCache.value(sourceIconName);
+        QString targetFile = m_targetDir + "/" + sourceIconName + ".dci";
 
-                // 如果有转换记录
-                if (recordedIconName == sourceIconName) {
-                    isRecord = true;
-                    
-                    // 构造目标文件路径
-                    QString targetFile = m_targetDir + "/" + recordedIconName + ".dci";
-
-                    if (recordedHash == currentHash && QFile::exists(targetFile)) {
-                        // 已经转换过，且文件未变化
-                        logMessage(QString("跳过已转换: %1").arg(sourceFile));
-                        return true;
-                    } else if (recordedHash != currentHash && QFile::exists(targetFile)) {
-                        // hash不匹配，需要重新转换
-                        logMessage(QString("源文件已变化，需要重新转换: %1").arg(sourceFile));
-                        return false;
-                    }
-
-                    break;
-                }
-            }
+        if (recordedHash == currentHash && QFile::exists(targetFile)) {
+            // 已经转换过，且文件未变化
+            return true;
+        } else if (recordedHash != currentHash && QFile::exists(targetFile)) {
+            // hash不匹配，需要重新转换
+            logMessage(QString("=========== %1, %2").arg(recordedHash, currentHash));
+            logMessage(QString("源文件已变化，需要重新转换: %1").arg(sourceFile));
+            return false;
         }
-    }
-
-    // 如果转换表中没有记录，检查是否已经存在同名的dci文件
-    if (!isRecord) {
-        QFileInfo sourceInfo(sourceFile);
+    } else {
+        // 如果转换表中没有记录，检查是否已经存在同名的dci文件
         QString targetFile = m_targetDir + "/" + sourceIconName + ".dci";
         
         if (QFile::exists(targetFile)) {
@@ -390,15 +427,10 @@ bool HicolorConverter::isNoNeedConverted(const QString &sourceFile, const QStrin
 
 void HicolorConverter::saveConversionRecord(const QString &sourceFile, const QString &targetFile, const QString &sourceHash)
 {
-    QMutexLocker locker(&m_recordMutex);
-    
-    QFile recordFile(m_recordFile);
-    if (!recordFile.open(QIODevice::WriteOnly | QIODevice::Append)) {
-        logMessage(QString("警告: 无法写入转换记录文件: %1").arg(m_recordFile));
-        return;
+    // 确保记录缓存已加载
+    if (!m_recordCacheLoaded) {
+        loadRecordCache();
     }
-    
-    QTextStream stream(&recordFile);
     
     // 计算图标名
     QString iconName;
@@ -409,119 +441,12 @@ void HicolorConverter::saveConversionRecord(const QString &sourceFile, const QSt
         // 多尺寸图标：sourceFile本身就是图标名
         iconName = sourceFile;
     }
-    
-    // 简化格式：只存储图标名和hash
-    stream << iconName << "|" << sourceHash << Qt::endl;
-}
 
-bool HicolorConverter::convertIconFile(const QString &sourceFile)
-{
-    QFileInfo sourceInfo(sourceFile);
-    QString targetFile = m_targetDir + "/" + sourceInfo.completeBaseName() + ".dci";
+    qWarning() << "saveConversionRecord" << iconName << sourceHash;
     
-    // 检查是否需要转换
-    QString currentHash = getFileHash(sourceFile);
-    if (isNoNeedConverted(sourceFile, currentHash)) {
-        // 文件未变化，跳过转换
-        return true;
-    }
-    
-    // 创建临时目录
-    QTemporaryDir tempDir;
-    if (!tempDir.isValid()) {
-        logMessage(QString("转换失败: 无法创建临时目录: %1").arg(sourceFile));
-        return false;
-    }
-    
-    // 创建临时源目录，直接放置单个图标文件
-    QString tempSourceDir = tempDir.path() + "/source";
-    QString tempTargetDir = tempDir.path() + "/target";
-    
-    QDir().mkpath(tempSourceDir);
-    
-    // 复制源文件到临时目录，使用原始文件名
-    QString tempSourceFile = tempSourceDir + "/" + sourceInfo.fileName();
-    if (!QFile::copy(sourceFile, tempSourceFile)) {
-        logMessage(QString("转换失败: 无法复制源文件到临时目录: %1").arg(sourceFile));
-        return false;
-    }
-    
-    // 执行转换
-    QProcess process;
-    process.setWorkingDirectory(tempDir.path());
-    
-    // 使用 env 命令来确保环境变量生效
-    process.setProgram(m_dciTool);
-    process.setArguments({tempSourceDir, "-o", tempTargetDir, "-O", "3=95"});
-    
-    process.start();
-    
-    if (!process.waitForFinished(30000)) { // 30秒超时
-        logMessage(QString("转换失败: dci-icon-theme 超时: %1").arg(sourceFile));
-        process.kill();
-        return false;
-    }
-    
-    QString standardOutput = process.readAllStandardOutput();
-    QString errorOutput = process.readAllStandardError();
-    
-    if (!errorOutput.isEmpty()) {
-        logMessage(QString("错误输出: %1").arg(errorOutput));
-    }
-    
-    if (process.exitCode() != 0) {
-        logMessage(QString("转换失败: dci-icon-theme 执行出错: %1, 退出代码: %2").arg(sourceFile).arg(process.exitCode()));
-        return false;
-    }
-    
-    // 查找生成的 dci 文件（现在应该直接在目标目录根目录）
-    QString expectedDciFile = tempTargetDir + "/" + sourceInfo.completeBaseName() + ".dci";
-    
-    if (QFile::exists(expectedDciFile)) {
-        // 移动到目标位置
-        if (QFile::exists(targetFile)) {
-            QFile::remove(targetFile);
-        }
-        
-        if (QFile::copy(expectedDciFile, targetFile)) {
-            logMessage(QString("转换成功: %1 -> %2").arg(sourceFile, targetFile));
-            
-            // 记录转换信息
-            QString sourceHash = getFileHash(sourceFile);
-            saveConversionRecord(sourceFile, targetFile, sourceHash);
-            
-            return true;
-        } else {
-            logMessage(QString("转换失败: 无法移动生成的 dci 文件: %1").arg(sourceFile));
-        }
-    } else {
-        // 如果直接查找失败，回退到递归查找
-        QDirIterator it(tempTargetDir, QStringList() << "*.dci", QDir::Files, QDirIterator::Subdirectories);
-        if (it.hasNext()) {
-            QString generatedDci = it.next();
-            
-            // 移动到目标位置
-            if (QFile::exists(targetFile)) {
-                QFile::remove(targetFile);
-            }
-            
-            if (QFile::copy(generatedDci, targetFile)) {
-                logMessage(QString("转换成功: %1 -> %2").arg(sourceFile, targetFile));
-                
-                // 记录转换信息
-                QString sourceHash = getFileHash(sourceFile);
-                saveConversionRecord(sourceFile, targetFile, sourceHash);
-                
-                return true;
-            } else {
-                logMessage(QString("转换失败: 无法移动生成的 dci 文件: %1").arg(sourceFile));
-            }
-        } else {
-            logMessage(QString("转换失败: 未找到生成的 dci 文件: %1").arg(sourceFile));
-        }
-    }
-    
-    return false;
+    // 更新内存缓存
+    m_recordCache[iconName] = sourceHash;
+    m_recordCacheModified = true;
 }
 
 QString HicolorConverter::getRelativePath(const QString &basePath, const QString &fullPath)
@@ -550,287 +475,17 @@ QStringList HicolorConverter::getSupportedIconFiles(const QString &directory)
     return result;
 }
 
-ConvertResult HicolorConverter::convertIconConcurrent(const ConvertTask &task)
-{
-    ConvertResult result;
-    result.success = false;
-    result.sourceFile = task.sourceFile;
-    
-    // 检查是否已经转换过
-    QString currentHash = getFileHash(task.sourceFile);
-    if (isNoNeedConverted(task.sourceFile, currentHash)) {
-        // logMessage(QString("跳过已转换: %1").arg(task.sourceFile));
-        result.success = true; // 跳过也算成功
-        result.targetFile = ""; // 空字符串表示跳过
-        return result;
-    }
-    
-    // 计算目标文件路径 - 直接放在目标目录下
-    QFileInfo sourceInfo(task.sourceFile);
-    QString targetFile = m_targetDir + "/" + sourceInfo.completeBaseName() + ".dci";
-    result.targetFile = targetFile;
-    
-    // 确保目标目录存在（应该在初始化时已经创建）
-    QDir targetDir(m_targetDir);
-    if (!targetDir.exists()) {
-        result.errorMessage = QString("目标目录不存在: %1").arg(m_targetDir);
-        return result;
-    }
-    
-    // 创建临时目录用于转换
-    QTemporaryDir tempDir;
-    if (!tempDir.isValid()) {
-        result.errorMessage = QString("无法创建临时目录");
-        return result;
-    }
-    
-    // 创建临时源目录，直接放置单个图标文件
-    QString tempSourceDir = tempDir.path() + "/source";
-    QString tempTargetDir = tempDir.path() + "/target";
-    
-    QDir().mkpath(tempSourceDir);
-    
-    // 复制源文件到临时目录，使用原始文件名
-    QString tempSourceFile = tempSourceDir + "/" + sourceInfo.fileName();
-    if (!QFile::copy(task.sourceFile, tempSourceFile)) {
-        result.errorMessage = QString("无法复制源文件到临时目录");
-        return result;
-    }
-    
-    // 执行转换
-    QProcess process;
-    process.setWorkingDirectory(tempDir.path());
-    
-    process.setProgram(m_dciTool);
-    process.setArguments({tempSourceDir, "-o", tempTargetDir, "-O", "3=95"});
-    
-    process.start();
-    
-    if (!process.waitForFinished(30000)) { // 30秒超时
-        result.errorMessage = QString("dci-icon-theme 超时") + process.readAll();
-        process.kill();
-        return result;
-    }
-    
-    if (process.exitCode() != 0) {
-        result.errorMessage = QString("dci-icon-theme 执行出错，退出代码: %1").arg(process.exitCode());
-        return result;
-    }
-    
-    // 查找生成的 dci 文件（现在应该直接在目标目录根目录）
-    QString expectedDciFile = tempTargetDir + "/" + sourceInfo.completeBaseName() + ".dci";
-    if (QFile::exists(expectedDciFile)) {
-        // 移动到目标位置 TODO 如果有就不要删除了，可能我们已经有自己画好的图标，只添加没有的
-        if (QFile::exists(targetFile)) {
-            QFile::remove(targetFile);
-        }
-        
-        if (QFile::copy(expectedDciFile, targetFile)) {
-            // 记录转换信息
-            saveConversionRecord(task.sourceFile, targetFile, currentHash);
-            result.success = true;
-            return result;
-        } else {
-            result.errorMessage = QString("无法移动生成的 dci 文件") + expectedDciFile + " " + targetFile + (QChar)QFile::exists(targetFile);
-        }
-    } else {
-        // 如果直接查找失败，回退到递归查找
-        QDirIterator it(tempTargetDir, QStringList() << "*.dci", QDir::Files, QDirIterator::Subdirectories);
-        if (it.hasNext()) {
-            QString generatedDci = it.next();
-            // 移动到目标位置
-            if (QFile::exists(targetFile)) {
-                QFile::remove(targetFile);
-            }
-            
-            if (QFile::copy(generatedDci, targetFile)) {
-                // 记录转换信息
-                saveConversionRecord(task.sourceFile, targetFile, currentHash);
-                result.success = true;
-                return result;
-            } else {
-                result.errorMessage = QString("无法移动生成的 dci 文件") + generatedDci + " " + targetFile + (QChar)QFile::exists(targetFile);
-            }
-        } else {
-            result.errorMessage = QString("未找到生成的 dci 文件");
-        }
-    }
-    
-    return result;
-}
-
-QList<MultiSizeConvertTask> HicolorConverter::collectMultiSizeIcons()
-{
-    QList<MultiSizeConvertTask> tasks;
-    QMap<QString, MultiSizeConvertTask> iconGroups;
-    
-    // 使用缓存的尺寸目录信息
-    for (const QString &sizeDir : m_dirCache.sizeDirectories) {
-        QString size = QFileInfo(sizeDir).dir().dirName(); // 获取尺寸 (如 "16x16")
-        QString sizeValue = size.split('x').first(); // 获取尺寸值 (如 "16")
-        
-        QStringList iconFiles = m_dirCache.iconFilesByDir.value(sizeDir);
-        
-        for (const QString &iconFile : iconFiles) {
-            QFileInfo fileInfo(iconFile);
-            QString iconName = fileInfo.completeBaseName();
-
-            if (!iconGroups.contains(iconName)) {
-                iconGroups[iconName].iconName = iconName;
-            }
-
-            iconGroups[iconName].sourceFiles.append(iconFile);
-            iconGroups[iconName].sizes.append(sizeValue);
-        }
-    }
-    
-    // 过滤出有多个尺寸的图标，并检查是否需要转换
-    for (auto it = iconGroups.begin(); it != iconGroups.end(); ++it) {
-        if (it.value().sourceFiles.size() >= 1) {
-            // 计算多尺寸图标的综合hash
-            QString combinedHash = calculateMultiSizeHash(it.value().sourceFiles);
-            
-            // 检查是否需要转换
-            if (!isNoNeedConverted(it.value().iconName, combinedHash)) {
-                tasks.append(it.value());
-            }
-        }
-    }
-    
-    // logMessage(QString("收集到 %1 个多尺寸图标").arg(tasks.size()));
-    return tasks;
-}
-
-ConvertResult HicolorConverter::convertMultiSizeIconConcurrent(const MultiSizeConvertTask &task)
-{
-    ConvertResult result;
-    result.success = false;
-    result.sourceFile = task.iconName;
-    
-    QString targetFile = m_targetDir + "/" + task.iconName + ".dci";
-    result.targetFile = targetFile;
-    
-    // 检查是否需要转换（检查所有源文件的哈希）
-    QString combinedHash;
-    for (const QString &sourceFile : task.sourceFiles) {
-        combinedHash += getFileHash(sourceFile);
-    }
-    
-    QCryptographicHash hash(QCryptographicHash::Md5);
-    hash.addData(combinedHash.toUtf8());
-    QString finalHash = hash.result().toHex();
-    
-    if (isNoNeedConverted(task.iconName, finalHash)) {
-        result.success = true;
-        result.targetFile = ""; // 空字符串表示跳过
-        return result;
-    }
-    
-    // 创建临时目录
-    QTemporaryDir tempDir;
-    if (!tempDir.isValid()) {
-        result.errorMessage = QString("无法创建临时目录");
-        return result;
-    }
-    
-    QString tempSourceDir = tempDir.path() + "/source";
-    QString tempTargetDir = tempDir.path() + "/target";
-    
-    // 创建扁平的尺寸目录结构
-    for (int i = 0; i < task.sourceFiles.size(); ++i) {
-        QString sizeDir = tempSourceDir + "/" + task.sizes[i];
-        QDir().mkpath(sizeDir);
-        
-        QFileInfo sourceInfo(task.sourceFiles[i]);
-        QString tempFile = sizeDir + "/" + task.iconName + "." + sourceInfo.suffix();
-        
-        if (!QFile::copy(task.sourceFiles[i], tempFile)) {
-            result.errorMessage = QString("无法复制源文件: %1").arg(task.sourceFiles[i]);
-            return result;
-        }
-    }
-    
-    QProcess process;
-    process.setWorkingDirectory(tempDir.path());
-    process.setProgram(m_dciTool);
-    
-    process.setArguments({tempSourceDir, "-o", tempTargetDir, "-O", "3=95"});
-    
-    process.start();
-    
-    if (!process.waitForFinished(30000)) {
-        result.errorMessage = QString("dci-icon-theme 超时").append(process.readAllStandardError());
-        process.kill();
-        return result;
-    }
-    
-    if (process.exitCode() != 0) {
-        result.errorMessage = QString("dci-icon-theme 执行出错，退出代码: %1").arg(process.exitCode());
-        return result;
-    }
-    
-    // 查找生成的 dci 文件
-    QString expectedDciFile = tempTargetDir + "/" + task.iconName + ".dci";
-    
-    if (QFile::exists(expectedDciFile)) {
-        // 移动到目标位置
-        if (QFile::exists(targetFile)) {
-            QFile::remove(targetFile);
-        }
-        
-        if (QFile::copy(expectedDciFile, targetFile)) {
-            // 记录转换信息
-            saveConversionRecord(task.iconName, targetFile, finalHash);
-            result.success = true;
-            return result;
-        } else {
-            result.errorMessage = QString("无法移动生成的 dci 文件");
-        }
-    } else {
-        // 查找实际生成的 dci 文件（可能有不同的命名）
-        QDirIterator it(tempTargetDir, QStringList() << "*.dci", QDir::Files, QDirIterator::Subdirectories);
-        if (it.hasNext()) {
-            QString generatedDci = it.next();
-            
-            // 移动到目标位置
-            if (QFile::exists(targetFile)) {
-                QFile::remove(targetFile);
-            }
-            
-            if (QFile::copy(generatedDci, targetFile)) {
-                // 记录转换信息
-                saveConversionRecord(task.iconName, targetFile, finalHash);
-                result.success = true;
-                return result;
-            } else {
-                result.errorMessage = QString("无法移动生成的 dci 文件") + generatedDci + " " + targetFile;
-            }
-        } else {
-            result.errorMessage = QString("未找到生成的 dci 文件");
-        }
-    }
-    
-    return result;
-}
-
 void HicolorConverter::scanAndConvert()
 {
-    logMessage("==== 开始分阶段转换 hicolor 应用图标 ====");
-    
-    // 阶段1: 扫描和准备阶段
-    logMessage("阶段1: 扫描所有图标并准备转换任务");
-    
     QSet<QString> processedIcons;  // 已处理的图标名称
     
-    // 优先处理多尺寸图标（*x*/apps 尺寸图标）- 最高优先级
-    logMessage("优先处理多尺寸图标（按尺寸目录分组批量转换）");
-    
     // 收集多尺寸图标任务
-    QMap<QString, MultiSizeConvertTask> multiSizeTasks;  // iconName -> MultiSizeConvertTask
+    QMap<QString, MultiSizeConvertTask> multiSizeTasks;
+
+    // 所有图标的所有尺寸文件
+    QMap<QString, QStringList> allIconSizes;
     
     for (const QString &sizeDir : m_dirCache.sizeDirectories) {
-        logMessage(QString("扫描尺寸目录: %1").arg(sizeDir));
-        
         // 获取该目录下的所有支持的图标文件
         QStringList iconFiles = m_dirCache.iconFilesByDir.value(sizeDir);
         
@@ -838,34 +493,55 @@ void HicolorConverter::scanAndConvert()
         QFileInfo dirInfo(sizeDir);
         QString sizeStr = dirInfo.dir().dirName();
         if (sizeStr.contains("x")) {
-            sizeStr = sizeStr.split("x").first();  // 16x16 -> 16
+            sizeStr = sizeStr.split("x").first();
         }
         
         for (const QString &sourceFile : iconFiles) {
             QFileInfo sourceInfo(sourceFile);
             QString iconName = sourceInfo.completeBaseName();
             
-            // 如果该图标已经被处理过，跳过
-            if (processedIcons.contains(iconName)) {
-                continue;
+            // 收集所有尺寸的文件
+            if (!allIconSizes.contains(iconName)) {
+                allIconSizes[iconName] = QStringList();
             }
+            allIconSizes[iconName].append(sourceFile);
             
-            // 检查是否需要转换
-            QString sourceHash = getFileHash(sourceFile);
-            if (!isNoNeedConverted(sourceFile, sourceHash)) {
-                // 添加到多尺寸任务中
-                if (!multiSizeTasks.contains(iconName)) {
-                    multiSizeTasks[iconName] = MultiSizeConvertTask{iconName, {}, {}};
-                }
-                multiSizeTasks[iconName].sourceFiles.append(sourceFile);
-                multiSizeTasks[iconName].sizes.append(sizeStr);
+            // 同时记录尺寸信息
+            if (!multiSizeTasks.contains(iconName)) {
+                multiSizeTasks[iconName] = MultiSizeConvertTask{iconName, {}, {}};
             }
+            multiSizeTasks[iconName].sourceFiles.append(sourceFile);
+            multiSizeTasks[iconName].sizes.append(sizeStr);
         }
     }
     
-    // 执行多尺寸图标批量转换
-    if (!multiSizeTasks.isEmpty()) {
-        QList<MultiSizeConvertTask> tasks = multiSizeTasks.values();
+    // 判断这些图标是否需要转换
+    QMap<QString, MultiSizeConvertTask> finalMultiSizeTasks;
+    
+    for (auto it = multiSizeTasks.begin(); it != multiSizeTasks.end(); ++it) {
+        QString iconName = it.key();
+        MultiSizeConvertTask &task = it.value();
+        
+        // 如果该图标已经被处理过，跳过
+        if (processedIcons.contains(iconName)) {
+            continue;
+        }
+
+        // 计算所有尺寸文件的综合hash
+        QString combinedHash = calculateMultiSizeHash(task.sourceFiles);
+
+        if (!isNoNeedConverted(iconName, combinedHash)) {
+            finalMultiSizeTasks[iconName] = task;
+            logMessage(QString("多尺寸图标 %1 需要转换，包含 %2 个尺寸").arg(iconName).arg(task.sourceFiles.size()));
+        } else {
+            processedIcons.insert(iconName);
+            // logMessage(QString("多尺寸图标 %1 无需转换").arg(iconName));
+        }
+    }
+    
+    // 多尺寸图标开始转换
+    if (!finalMultiSizeTasks.isEmpty()) {
+        QList<MultiSizeConvertTask> tasks = finalMultiSizeTasks.values();
         logMessage(QString("准备批量转换 %1 个多尺寸图标").arg(tasks.size()));
         convertMultiSizeIconBatch(tasks);
         
@@ -873,10 +549,9 @@ void HicolorConverter::scanAndConvert()
         for (const auto &task : tasks) {
             processedIcons.insert(task.iconName);
         }
+    } else {
+        logMessage("没有需要转换的多尺寸图标");
     }
-    
-    // 阶段2: 处理其他优先级的单尺寸图标
-    logMessage("阶段2: 处理其他优先级的单尺寸图标");
     
     QList<ConvertTask> singleSizeIconTasks;
     
@@ -888,8 +563,6 @@ void HicolorConverter::scanAndConvert()
         if (!m_dirCache.iconFilesByDir.contains(priorityDir)) {
             continue;
         }
-        
-        logMessage(QString("扫描优先级目录: %1").arg(priorityDir));
         
         // 获取该目录下的所有支持的图标文件
         QStringList iconFiles = m_dirCache.iconFilesByDir.value(priorityDir);
@@ -926,52 +599,39 @@ void HicolorConverter::cleanupOrphanedDci()
 {
     logMessage("开始清理孤立的 dci 文件");
     
-    QFile recordFile(m_recordFile);
-    if (!recordFile.open(QIODevice::ReadOnly)) {
-        logMessage("没有转换记录文件，跳过清理");
-        return;
+    // 确保记录缓存已加载
+    if (!m_recordCacheLoaded) {
+        loadRecordCache();
     }
     
-    QStringList validRecords;
     int cleanedCount = 0;
     
-    QTextStream stream(&recordFile);
-    QString line;
-    
-    while (stream.readLineInto(&line)) {
-        QStringList parts = line.split('|');
-        if (parts.size() >= 2) {
-            QString iconName = parts[0];
-            QString recordedHash = parts[1];
-            
-            // 检查该图标是否还存在于原始目录中
-            bool shouldKeep = m_dirCache.allIconNames.contains(iconName);
-            
-            if (shouldKeep) {
-                // 源文件存在，保留记录
-                validRecords << line;
-            } else {
-                // 源文件不存在，删除对应的 dci 文件
-                QString targetFile = m_targetDir + "/" + iconName + ".dci";
-                if (QFile::exists(targetFile)) {
-                    if (QFile::remove(targetFile)) {
-                        logMessage(QString("删除孤立的 dci 文件: %1 (源图标已删除: %2)").arg(targetFile, iconName));
-                        cleanedCount++;
-                    }
+    // 遍历内存缓存中的记录
+    QStringList toRemove;
+    for (auto it = m_recordCache.begin(); it != m_recordCache.end(); ++it) {
+        QString iconName = it.key();
+        
+        // 检查该图标是否还存在于原始目录中
+        bool shouldKeep = m_dirCache.allIconNames.contains(iconName);
+        
+        if (!shouldKeep) {
+            // 源文件不存在，删除对应的 dci 文件
+            QString targetFile = m_targetDir + "/" + iconName + ".dci";
+            if (QFile::exists(targetFile)) {
+                if (QFile::remove(targetFile)) {
+                    logMessage(QString("删除孤立的 dci 文件: %1 (源图标已删除: %2)").arg(targetFile, iconName));
+                    cleanedCount++;
                 }
             }
+            // 标记从缓存中移除
+            toRemove << iconName;
         }
     }
     
-    recordFile.close();
-    
-    // 重写记录文件
-    if (recordFile.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
-        QTextStream writeStream(&recordFile);
-        for (const QString &record : validRecords) {
-            writeStream << record << "\n";
-        }
-        recordFile.close();
+    // 从内存缓存中移除孤立的记录
+    for (const QString &iconName : toRemove) {
+        m_recordCache.remove(iconName);
+        m_recordCacheModified = true;
     }
     
     logMessage(QString("清理完成 - 删除孤立文件: %1").arg(cleanedCount));
@@ -983,16 +643,12 @@ void HicolorConverter::convertMultiSizeIconBatch(const QList<MultiSizeConvertTas
         return;
     }
     
-    logMessage(QString("阶段2: 开始批量转换 %1 个多尺寸图标").arg(tasks.size()));
-    
-    // 创建多尺寸图标的临时目录
     QString tempDir = QDir::temp().absoluteFilePath("hicolor-convert-multisize");
     QDir().mkpath(tempDir);
-    
-    // 准备多尺寸图标的目录结构
-    // 按尺寸组织目录结构，将所有多尺寸图标按尺寸分类放置
+
     QSet<QString> createdSizeDirs;
     
+    // 准备目录结构 16/ 24/ 32/ 48/ 64/ 96/ 128/ 256/
     for (const MultiSizeConvertTask &task : tasks) {
         for (int i = 0; i < task.sourceFiles.size(); ++i) {
             QString sourceFile = task.sourceFiles[i];
@@ -1012,15 +668,14 @@ void HicolorConverter::convertMultiSizeIconBatch(const QList<MultiSizeConvertTas
         }
     }
     
-    // 为多尺寸图标转换准备输出目录
+    // 准备输出目录
     QString multiSizeOutputDir = m_targetDir + "_multisize_temp";
     
     // 确保输出目录不存在
     if (QDir(multiSizeOutputDir).exists()) {
         QDir(multiSizeOutputDir).removeRecursively();
     }
-    
-    // 批量执行转换命令
+
     QStringList arguments;
     arguments << tempDir;
     arguments << "-o" << multiSizeOutputDir;
@@ -1029,7 +684,7 @@ void HicolorConverter::convertMultiSizeIconBatch(const QList<MultiSizeConvertTas
     QProcess process;
     process.start(m_dciTool, arguments);
     process.waitForFinished(-1);
-    
+
     if (process.exitCode() == 0) {
         logMessage(QString("多尺寸图标批量转换成功，共转换 %1 个图标").arg(tasks.size()));
         
@@ -1071,8 +726,6 @@ void HicolorConverter::convertSingleSizeIconBatch(const QList<ConvertTask> &task
     if (tasks.isEmpty()) {
         return;
     }
-    
-    logMessage(QString("阶段3: 开始批量转换 %1 个单尺寸图标").arg(tasks.size()));
     
     // 创建单尺寸图标的临时目录
     QString singleSizeTempDir = QDir::temp().absoluteFilePath("hicolor-convert-singlesize");
@@ -1148,16 +801,17 @@ void HicolorConverter::convertSingleSizeIconBatch(const QList<ConvertTask> &task
 
 int HicolorConverter::run()
 {
-    logMessage("==== hicolor 应用图标到 dci 转换器启动 ====");
-    
+    logMessage("==== 开始 ====");
     // 扫描并转换图标
     scanAndConvert();
     
     // 清理孤立的 dci 文件
     cleanupOrphanedDci();
     
-    logMessage("==== hicolor 应用图标到 dci 转换器完成 ====");
-    
+    // 将内存缓存写入文件
+    flushRecordCache();
+    logMessage("==== 完成 ====");
+
     return 0;
 }
 

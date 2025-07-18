@@ -1,0 +1,7 @@
+/home/uos/Dev/deepin-desktop-theme/tools/xdgicon2dci/build/CMakeFiles/xdgicon2dci.dir
+/home/uos/Dev/deepin-desktop-theme/tools/xdgicon2dci/build/CMakeFiles/edit_cache.dir
+/home/uos/Dev/deepin-desktop-theme/tools/xdgicon2dci/build/CMakeFiles/rebuild_cache.dir
+/home/uos/Dev/deepin-desktop-theme/tools/xdgicon2dci/build/CMakeFiles/list_install_components.dir
+/home/uos/Dev/deepin-desktop-theme/tools/xdgicon2dci/build/CMakeFiles/install.dir
+/home/uos/Dev/deepin-desktop-theme/tools/xdgicon2dci/build/CMakeFiles/install/local.dir
+/home/uos/Dev/deepin-desktop-theme/tools/xdgicon2dci/build/CMakeFiles/install/strip.dir

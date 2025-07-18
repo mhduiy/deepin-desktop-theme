@@ -1,1 +1,1 @@
-add_subdirectory("hicolorconvert")
+add_subdirectory("xdgicon2dci")
